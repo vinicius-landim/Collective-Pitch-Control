@@ -19,6 +19,13 @@ from PySide6.QtNetwork import QHostAddress, QUdpSocket, QAbstractSocket
 
 logger = logging.getLogger(__name__)
 
+MANEUVER_IDS: dict[str, int] = {
+    "Manobra 1": 1,
+    "Manobra 2": 2,
+    "Manobra 3": 3,
+    "Manobra 4": 4,
+}
+
 
 @dataclass
 class UDPPacket:
@@ -194,18 +201,30 @@ class UDPReceiver(QObject):
         }
 
         # Protocolo principal: CSV iniciando com 'C'
+        # Formato enviado pelo main.cpp (Raspberry Pi):
+        # "C,up,down,trim_release,override,hx_net,pos_top,pos_bottom"
         try:
             decoded_str = data.decode("utf-8")
             parts = [part.strip() for part in decoded_str.strip().split(",")]
-            if len(parts) == 6 and parts[0] == "C":
+            if len(parts) == 8 and parts[0] == "C":
                 result["parsed_data"] = {
                     "beep_trim_up": int(parts[1]),
                     "beep_trim_down": int(parts[2]),
                     "trim_release": int(parts[3]),
                     "override": int(parts[4]),
                     "load_cell": int(parts[5]),
+                    "pos_top": int(parts[6]),
+                    "pos_bottom": int(parts[7]),
                 }
-                print(f"beep_trim_up: {result["parsed_data"]["beep_trim_up"]} | beep_trim_down: {result["parsed_data"]["beep_trim_down"]} | trim_release: {result["parsed_data"]["trim_release"]} | override: {result["parsed_data"]["override"]} | load_cell: {result["parsed_data"]["load_cell"]} \n")
+                logger.debug(
+                    f"beep_trim_up: {result['parsed_data']['beep_trim_up']} | "
+                    f"beep_trim_down: {result['parsed_data']['beep_trim_down']} | "
+                    f"trim_release: {result['parsed_data']['trim_release']} | "
+                    f"override: {result['parsed_data']['override']} | "
+                    f"load_cell: {result['parsed_data']['load_cell']} | "
+                    f"pos_top: {result['parsed_data']['pos_top']} | "
+                    f"pos_bottom: {result['parsed_data']['pos_bottom']}"
+                )
                 result["parse_format"] = "csv_c"
                 return result
         except (ValueError, UnicodeDecodeError):
@@ -291,7 +310,12 @@ class MockUDPSender(QObject):
         trim_release = 0 if trim_hold else 1
         override = 0 if pa_active else 1
         load_cell = int(round(pilot_force * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        pos_top = -32767
+        pos_bottom = 32767
+        data = (
+            f"C,{beep_up},{beep_down},{trim_release},{override},"
+            f"{load_cell},{pos_top},{pos_bottom}"
+        ).encode("utf-8")
         self.socket.writeDatagram(
             data,
             QHostAddress(self.receiver_host),
@@ -332,6 +356,7 @@ class CommandSender(QObject):
         self.autopilot_active = False
         self.hydraulic_failure = False
         self.transducer_position = 0
+        self.maneuver_id = 0
         self._send_interval_ms = max(50, min(150, int(send_interval_ms)))
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._send_periodic_control)
@@ -368,6 +393,7 @@ class CommandSender(QObject):
         autopilot_active: Optional[bool] = None,
         hydraulic_failure: Optional[bool] = None,
         transducer_position: Optional[int] = None,
+        maneuver_id: Optional[int] = None,
     ) -> None:
         if autopilot_active is not None:
             self.autopilot_active = bool(autopilot_active)
@@ -375,11 +401,13 @@ class CommandSender(QObject):
             self.hydraulic_failure = bool(hydraulic_failure)
         if transducer_position is not None:
             self.transducer_position = int(transducer_position)
+        if maneuver_id is not None:
+            self.maneuver_id = int(maneuver_id)
 
     def _build_control_payload(self) -> bytes:
         return (
             f"P,{int(self.autopilot_active)},{int(self.hydraulic_failure)},"
-            f"{int(self.transducer_position)}"
+            f"{int(self.transducer_position)},{int(self.maneuver_id)}"
         ).encode("utf-8")
 
     def _send_periodic_control(self) -> None:
@@ -400,6 +428,7 @@ class CommandSender(QObject):
                         "autopilot_active": self.autopilot_active,
                         "hydraulic_failure": self.hydraulic_failure,
                         "transducer_position": self.transducer_position,
+                        "maneuver_id": self.maneuver_id,
                     }
                 )
                 return True
@@ -431,9 +460,12 @@ class CommandSender(QObject):
             bool: True se enviado com sucesso, False caso contrário
         """
         try:
-            del maneuver_name
+            maneuver_id = MANEUVER_IDS.get(maneuver_name, 0)
             del parameters
-            self.set_control_state(autopilot_active=(str(action).lower() != "stop"))
+            self.set_control_state(
+                autopilot_active=(str(action).lower() != "stop"),
+                maneuver_id=maneuver_id if str(action).lower() != "stop" else 0,
+            )
             return self._send_control_packet()
         except Exception as e:
             error_msg = f"Exceção ao enviar comando: {str(e)}"
@@ -463,12 +495,12 @@ class CommandSender(QObject):
             self.error_occurred.emit(error_msg)
             return False
 
-    def send_control_command(self, position_percent: float, trim_hold: bool, beep_trim: str = "NEUTRAL") -> bool:
+    def send_control_command(self, transducer_position: int, trim_hold: bool, beep_trim: str = "NEUTRAL") -> bool:
         """
         Envia um comando de controle direto para o Raspberry Pi.
 
         Args:
-            position_percent: Posição desejada (0-100%)
+            transducer_position: Posição desejada em unidades brutas do transdutor
             trim_hold: Se deve ativar o hold do trim
             beep_trim: Direção do beep ("UP", "DOWN", "NEUTRAL")
 
@@ -478,7 +510,7 @@ class CommandSender(QObject):
         del trim_hold
         del beep_trim
         self.set_control_state(
-            transducer_position=int(round(float(position_percent) * 100.0)),
+            transducer_position=int(round(float(transducer_position))),
         )
         return self._send_control_packet()
 
@@ -526,6 +558,13 @@ class MockRaspberryAutopilot(QObject):
         self._t = 0.0
         self._dt = 0.1
         self._transducer_position = int(self.position_percent * 100.0)
+        self.maneuver_id = 0
+        self._pa_direction = 1
+        self._pa_step_index = 0
+        self._pa_step_hold = 0.0
+        self.pos_top = -32767
+        self.pos_bottom = 0
+        self.calibrated = True
 
     def start(self, interval_ms: int = 50) -> bool:
         try:
@@ -572,17 +611,34 @@ class MockRaspberryAutopilot(QObject):
             payload = bytes(dg.data()).decode("utf-8", errors="ignore").strip()
             try:
                 parts = [part.strip() for part in payload.split(",")]
-                if len(parts) != 4 or parts[0] != "P":
+                if len(parts) == 5 and parts[0] == "P":
+                    autopilot_active = bool(int(parts[1]))
+                    hydraulic_failure = bool(int(parts[2]))
+                    transducer_position = int(parts[3])
+                    maneuver_id = int(parts[4])
+                elif len(parts) == 4 and parts[0] == "P":
+                    autopilot_active = bool(int(parts[1]))
+                    hydraulic_failure = bool(int(parts[2]))
+                    transducer_position = int(parts[3])
+                    maneuver_id = 1 if autopilot_active else 0
+                else:
                     continue
-                autopilot_active = bool(int(parts[1]))
-                hydraulic_failure = bool(int(parts[2]))
-                transducer_position = int(parts[3])
             except Exception:
                 continue
 
+            previous_maneuver = self.maneuver_id
             self.pa_active = autopilot_active
             self.hydraulic_failure = hydraulic_failure
             self._transducer_position = transducer_position
+            self.maneuver_id = maneuver_id
+            self.selected_maneuver = next(
+                (name for name, mid in MANEUVER_IDS.items() if mid == maneuver_id),
+                "Manobra 1",
+            )
+            if maneuver_id != previous_maneuver:
+                self._t = 0.0
+                self._pa_step_index = 0
+                self._pa_step_hold = 0.0
             self.maneuver_active = autopilot_active
             self.maneuver_state = "RUNNING" if autopilot_active else "IDLE"
             self.trim_hold = not autopilot_active
@@ -602,6 +658,29 @@ class MockRaspberryAutopilot(QObject):
             return levels[phase]
         return 40.0 + 18.0 * math.sin(0.5 * t)
 
+    def _simulate_maneuver_percent(self, maneuver_id: int, t: float) -> float:
+        if maneuver_id == 1:
+            phase = int((t // 4.0) % 6)
+            if phase % 2 == 0:
+                return min(100.0, (t % 4.0) / 4.0 * 100.0)
+            return max(0.0, 100.0 - ((t % 4.0) / 4.0 * 100.0))
+        if maneuver_id == 2:
+            phase = int((t // 5.0) % 4)
+            if phase % 2 == 0:
+                return min(100.0, (t % 5.0) / 1.5 * 100.0)
+            return max(0.0, 100.0 - ((t % 5.0) / 3.5 * 100.0))
+        if maneuver_id == 3:
+            return 30.0 + 15.0 * math.sin(1.2 * t)
+        if maneuver_id == 4:
+            levels = [20.0, 45.0, 75.0, 30.0]
+            if self._pa_step_hold <= 0.0:
+                self._pa_step_hold = t
+            if (t - self._pa_step_hold) >= 2.0:
+                self._pa_step_index = (self._pa_step_index + 1) % 4
+                self._pa_step_hold = t
+            return levels[self._pa_step_index]
+        return self.position_percent
+
     def _tick(self) -> None:
         import time
 
@@ -610,18 +689,22 @@ class MockRaspberryAutopilot(QObject):
             self.pilot_force_kg = 0.0
             self.beep_trim = "DOWN"
             self.trim_hold = True
-        elif self.maneuver_active:
+        elif self.maneuver_active and self.maneuver_id > 0:
             prev = self.position_percent
-            target_percent = max(0.0, min(100.0, self._transducer_position / 100.0))
-            self.position_percent += (target_percent - self.position_percent) * 0.25
+            target_percent = max(
+                15.0,
+                min(85.0, self._simulate_maneuver_percent(self.maneuver_id, self._t)),
+            )
+            self.position_percent += (target_percent - self.position_percent) * 0.35
             slope = self.position_percent - prev
-            if slope > 0.2:
+            if slope > 0.05:
                 self.beep_trim = "UP"
-            elif slope < -0.2:
+            elif slope < -0.05:
                 self.beep_trim = "DOWN"
             else:
                 self.beep_trim = "NEUTRAL"
             self.pilot_force_kg = max(0.0, min(8.0, abs(slope) * 0.8 + 1.2))
+            self.trim_hold = True
             self._t += self._dt
         else:
             self.position_percent = self.position_percent
@@ -635,10 +718,14 @@ class MockRaspberryAutopilot(QObject):
         trim_release = 0 if self.trim_hold else 1
         override = 0 if self.pa_active else 1
         load_cell = int(round(self.pilot_force_kg * 10.0))
-        data = f"C,{beep_up},{beep_down},{trim_release},{override},{load_cell}".encode("utf-8")
+        pos_top_to_send = self.pos_top if self.calibrated else 0
+        pos_bottom_to_send = self.pos_bottom if self.calibrated else 0
+        data = (
+            f"C,{beep_up},{beep_down},{trim_release},{override},"
+            f"{load_cell},{pos_top_to_send},{pos_bottom_to_send}"
+        ).encode("utf-8")
         self.telemetry_socket.writeDatagram(
             data,
             QHostAddress(self.telemetry_host),
             self.telemetry_port,
         )
-

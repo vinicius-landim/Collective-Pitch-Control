@@ -1,1 +1,1 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/coletivo.dir/link.d CMakeFiles/coletivo.dir/src/main.cpp.o -o coletivo  -lgpiodcxx -lgpiod -lpthread
+/usr/bin/c++ CMakeFiles/coletivo.dir/src/main.cpp.o -o coletivo  -lgpiodcxx -lgpiod -lpthread 

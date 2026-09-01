@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from scca.styles import DASHBOARD_QSS
-from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot
+from scca.udp_receiver import UDPReceiver, CommandSender, MockRaspberryAutopilot, MANEUVER_IDS
 
 
 class ToggleSliderButton(QAbstractButton):
@@ -159,6 +159,7 @@ class LinuxJoystickReader(QObject):
     """Leitura local do joystick do Linux usado para a posição do coletivo."""
 
     position_changed = Signal(float)
+    raw_position_changed = Signal(int)
     connection_changed = Signal(bool)
     error_occurred = Signal(str)
 
@@ -179,12 +180,20 @@ class LinuxJoystickReader(QObject):
         self._position_percent = 0.0
         self._filtered_position_percent = 0.0
         self._has_filtered_position = False
+        self._raw_position = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_device)
 
     @property
     def position_percent(self) -> float:
         return self._position_percent
+
+    @property
+    def raw_position(self) -> int:
+        """Último valor bruto do eixo (escala nativa do driver de joystick,
+        sem suavização nem conversão). É essa escala que deve circular no
+        protocolo UDP com o Raspberry Pi."""
+        return self._raw_position
 
     def start(self, poll_interval_ms: int = 20) -> None:
         self._timer.start(max(10, poll_interval_ms))
@@ -284,6 +293,9 @@ class LinuxJoystickReader(QObject):
             if number != self.axis_number:
                 continue
 
+            self._raw_position = int(value)
+            self.raw_position_changed.emit(self._raw_position)
+
             new_position = self._raw_to_percent(value)
             smoothed_position = self._smooth_position(new_position)
             if abs(smoothed_position - self._position_percent) >= 0.05:
@@ -304,7 +316,7 @@ class SccaDashboard(QMainWindow):
         self.udp_receiver.connection_status_changed.connect(self._on_udp_connection_changed)
 
         # Inicializar Command Sender (envia manobras para Raspberry Pi)
-        initial_host = os.getenv("SCCA_COMMAND_HOST", "127.0.0.1")
+        initial_host = os.getenv("SCCA_COMMAND_HOST", "10.0.0.1")
         try:
             initial_port = int(os.getenv("SCCA_COMMAND_PORT", "5005"))
         except ValueError:
@@ -371,6 +383,7 @@ class SccaDashboard(QMainWindow):
 
         self.joystick_reader = LinuxJoystickReader()
         self.joystick_reader.position_changed.connect(self._on_joystick_position_changed)
+        self.joystick_reader.raw_position_changed.connect(self._on_joystick_raw_position_changed)
         self.joystick_reader.connection_changed.connect(self._on_joystick_connection_changed)
         self.joystick_reader.error_occurred.connect(self._on_joystick_error)
 
@@ -379,6 +392,13 @@ class SccaDashboard(QMainWindow):
         self.flash_timer.timeout.connect(self._toggle_alert_flash)
         self._flash_on = False
         self._last_udp_packet_time = 0.0
+
+        self._calibration_pos_top: int | None = None
+        self._calibration_pos_bottom: int | None = None
+        self._is_calibrated = False
+        self._joystick_raw_position = 0
+        self._filtered_calibrated_percent = 0.0
+        self._has_filtered_calibrated_percent = False
 
         # Estado local do comando enviado ao Raspberry (pacote P)
         self._control_tick_s = max(0.05, min(0.15, initial_interval_ms / 1000.0))
@@ -398,6 +418,18 @@ class SccaDashboard(QMainWindow):
         self.joystick_reader.start()
         self.command_sender.start_stream()
         self.control_timer.start()
+
+        self.logger.info(
+            "Dashboard UDP ativo | telemetria :5006 | comandos -> "
+            f"{self._command_target_host}:{self._command_target_port}"
+        )
+        self.logger.info(
+            "Ordem de partida: 1) este dashboard  2) agente na Raspberry (calibragem exige pacotes P)."
+        )
+        self.maneuver_hint.setText(
+            f"Enviando P -> {self._command_target_host}:{self._command_target_port} | "
+            "Inicie a Raspberry depois do dashboard"
+        )
 
     def _panel_frame(self) -> QFrame:
         frame = QFrame()
@@ -444,6 +476,23 @@ class SccaDashboard(QMainWindow):
         status_row.addWidget(self.joystick_status)
         status_row.addStretch(1)
         layout.addLayout(status_row)
+
+        layout.addSpacing(8)
+
+        calib_row = QHBoxLayout()
+        calib_label = QLabel("Calibragem do transdutor")
+        calib_label.setObjectName("subtitle")
+        self.calibration_led = LedIndicator("#16ff9a", "#3b4754")
+        calib_row.addWidget(calib_label)
+        calib_row.addWidget(self.calibration_led)
+        calib_row.addStretch(1)
+        layout.addLayout(calib_row)
+
+        self.calibration_status = QLabel("Aguardando calibragem do Raspberry Pi...")
+        self.calibration_status.setObjectName("subtitle")
+        self.calibration_status.setStyleSheet("color: #82d8ff; font-size: 10px;")
+        self.calibration_status.setWordWrap(True)
+        layout.addWidget(self.calibration_status)
         return panel
 
     def _state_label(self, text: str, state: str = "off") -> QLabel:
@@ -724,6 +773,39 @@ class SccaDashboard(QMainWindow):
         label.style().polish(label)
         label.update()
 
+    def _update_calibration_display(self) -> None:
+        """Atualiza o LED e o texto de status da calibragem automática.
+        Também força a atualização imediata da barra/label de posição
+        (position_bar/position_display) usando a última leitura bruta
+        conhecida do joystick (_joystick_raw_position). 
+        """
+        pos_top = self._calibration_pos_top
+        pos_bottom = self._calibration_pos_bottom
+
+        if pos_top is None or pos_bottom is None:
+            self.calibration_led.set_on(False)
+            self.calibration_status.setText("Aguardando calibragem do Raspberry Pi...")
+            return
+
+        if self._is_calibrated:
+            lower_bound = min(pos_top, pos_bottom)
+            upper_bound = max(pos_top, pos_bottom)
+            self.calibration_led.set_on(True)
+            self.calibration_status.setText(
+                f"Calibrado | Faixa do transdutor: [{lower_bound}, {upper_bound}]"
+            )
+
+            calibrated_percent = self._raw_position_to_calibrated_percent(self._joystick_raw_position)
+            if calibrated_percent is not None:
+                smoothed_percent = self._smooth_calibrated_percent(calibrated_percent)
+                self.position_bar.setValue(int(max(0.0, min(100.0, smoothed_percent)) * 10))
+                self.position_display.setText(f"{smoothed_percent:.1f}%")
+        else:
+            self.calibration_led.set_on(False)
+            self.calibration_status.setText(
+                f"Calibrando... (top={pos_top}, bottom={pos_bottom})"
+            )
+
     def _toggle_alert_flash(self) -> None:
         self._flash_on = not self._flash_on
         self.alert_lbl.setProperty("flash", "true" if self._flash_on else "false")
@@ -747,23 +829,60 @@ class SccaDashboard(QMainWindow):
             return levels[phase]
         return int(10000 + 6000 * math.sin(0.55 * t))
 
+    def _clamp_to_calibration(self, target_position: int) -> int:
+        """Restringe um alvo de posição à faixa descoberta pela calibragem
+        automática do Raspberry Pi (entre pos_top e pos_bottom).
+        """
+        if not self._is_calibrated:
+            return target_position
+
+        pos_top = self._calibration_pos_top
+        pos_bottom = self._calibration_pos_bottom
+        if pos_top is None or pos_bottom is None:
+            return target_position
+
+        lower_bound = min(pos_top, pos_bottom)
+        upper_bound = max(pos_top, pos_bottom)
+        return max(lower_bound, min(upper_bound, target_position))
+
+    def _raw_position_to_calibrated_percent(self, raw_value: int) -> float | None:
+        """Converte um valor bruto do transdutor para percentual (0-100%)
+        usando a faixa [pos_top, pos_bottom] descoberta na calibragem.
+        """
+        if not self._is_calibrated:
+            return None
+
+        low = self._calibration_pos_top
+        high = self._calibration_pos_bottom
+        if low is None or high is None or high == low:
+            return None
+
+        if low > high:
+            low, high = high, low
+
+        clipped = max(low, min(high, raw_value))
+        percent = ((clipped - high) / (low - high)) * 100.0
+        if self.joystick_reader.invert_axis:
+            percent = 100.0 - percent
+        return max(0.0, min(100.0, percent))
+
     def _update_control_stream_state(self) -> None:
         active_maneuver = self._get_active_maneuver_name()
         autopilot_active = active_maneuver is not None
         hydraulic_failure = bool(self.pane_tile.isChecked())
 
-        self._control_time_s += self._control_tick_s
         if autopilot_active and active_maneuver is not None:
             self._selected_maneuver_name = active_maneuver
-            self._transducer_cmd = self._maneuver_transducer_profile(active_maneuver, self._control_time_s)
-        else:
-            # Sem manobra ativa, retorna o comando para zero sem salto brusco.
-            self._transducer_cmd = int(self._transducer_cmd * 0.85)
+
+        # Envia leitura atual do transdutor (joystick) para o Raspberry usar como feedback.
+        safe_target = self._clamp_to_calibration(self._joystick_raw_position)
+        maneuver_id = MANEUVER_IDS.get(self._selected_maneuver_name, 0) if autopilot_active else 0
 
         self.command_sender.set_control_state(
             autopilot_active=autopilot_active,
             hydraulic_failure=hydraulic_failure,
-            transducer_position=max(0, self._transducer_cmd),
+            transducer_position=safe_target,
+            maneuver_id=maneuver_id,
         )
 
     def _extract_telemetry(self, packet_dict: dict) -> dict:
@@ -780,11 +899,17 @@ class SccaDashboard(QMainWindow):
 
         raw_load_cell = parsed.get("load_cell")
 
-        if all(k in parsed for k in ("beep_trim_up", "beep_trim_down", "trim_release", "override", "load_cell")):
+        required_keys = (
+            "beep_trim_up", "beep_trim_down", "trim_release",
+            "override", "load_cell", "pos_top", "pos_bottom",
+        )
+        if all(k in parsed for k in required_keys):
             beep_up = int(parsed.get("beep_trim_up", 0))
             beep_down = int(parsed.get("beep_trim_down", 0))
             trim_release = int(parsed.get("trim_release", 0))
             load_cell = int(parsed.get("load_cell", 0))
+            pos_top = int(parsed.get("pos_top", 0))
+            pos_bottom = int(parsed.get("pos_bottom", 0))
 
             if beep_up:
                 beep_trim = "UP"
@@ -794,6 +919,8 @@ class SccaDashboard(QMainWindow):
                 beep_trim = "NEUTRAL"
 
             pilot_force_kg = max(0.0, to_float(load_cell, 0.0) / 10.0)
+            # is_calibrated é inferido por pos_top != pos_bottom. (pos_top e pos_bottom serão enviados com seus valores distintos somente após a calibragem completa)
+            is_calibrated = pos_top != pos_bottom
             return {
                 "trim_hold": trim_release == 0,
                 "beep_trim": beep_trim,
@@ -801,6 +928,9 @@ class SccaDashboard(QMainWindow):
                 "hydraulic_failure": bool(self.pane_tile.isChecked()),
                 "raw_load_cell": raw_load_cell,
                 "pilot_force_kg": pilot_force_kg,
+                "pos_top": pos_top,
+                "pos_bottom": pos_bottom,
+                "is_calibrated": is_calibrated,
                 "udp_connected": True,
                 "usb_connected": True,
                 "selected_maneuver": next((n for n, b in self.maneuver_buttons.items() if b.isChecked()), "Manobra 1"),
@@ -816,6 +946,15 @@ class SccaDashboard(QMainWindow):
         raw_load_cell = data.get("raw_load_cell")
         self.raw_load_cell_value.setText("--" if raw_load_cell is None else str(raw_load_cell))
         self.force_gauge.set_force_kg(data["pilot_force_kg"])
+
+        pos_top = data.get("pos_top")
+        pos_bottom = data.get("pos_bottom")
+        is_calibrated = bool(data.get("is_calibrated", False))
+        if pos_top is not None and pos_bottom is not None:
+            self._calibration_pos_top = pos_top
+            self._calibration_pos_bottom = pos_bottom
+            self._is_calibrated = is_calibrated
+            self._update_calibration_display()
 
         trim_hold = data["trim_hold"]
         self._set_state(self.trim_hold_lbl, "ok" if trim_hold else "off")
@@ -878,16 +1017,62 @@ class SccaDashboard(QMainWindow):
         state_text = state_text_map.get(state_raw, state_raw)
         self.maneuver_hint.setText(f"{selected} | Status: {state_text}")
 
+    def _smooth_calibrated_percent(self, new_percent: float) -> float:
+        """Suaviza o percentual calibrado apenas para fins de exibição"""
+        snap_margin = 0.5  # percentual; pequeno o suficiente para não mascarar movimento real
+
+        if new_percent <= snap_margin:
+            self._filtered_calibrated_percent = 0.0
+            self._has_filtered_calibrated_percent = True
+            return 0.0
+
+        if new_percent >= 100.0 - snap_margin:
+            self._filtered_calibrated_percent = 100.0
+            self._has_filtered_calibrated_percent = True
+            return 100.0
+
+        deadband = self.joystick_reader.deadband_percent
+        alpha = self.joystick_reader.smoothing_alpha
+
+        if not self._has_filtered_calibrated_percent:
+            self._filtered_calibrated_percent = new_percent
+            self._has_filtered_calibrated_percent = True
+            return new_percent
+
+        delta = new_percent - self._filtered_calibrated_percent
+        if abs(delta) <= deadband:
+            return self._filtered_calibrated_percent
+
+        self._filtered_calibrated_percent += delta * alpha
+        return self._filtered_calibrated_percent
+
     def _on_joystick_position_changed(self, position_percent: float) -> None:
-        self.position_bar.setValue(int(max(0.0, min(100.0, position_percent)) * 10))
-        self.position_display.setText(f"{position_percent:.1f}%")
+        # Mantido como fallback de exibição enquanto a calibragem do
+        # Raspberry Pi ainda não chegou (usa min_raw/max_raw do ambiente).
+        # Uma vez calibrado, _on_joystick_raw_position_changed assume a
+        # exibição usando a faixa [pos_top, pos_bottom] real.
+        if not self._is_calibrated:
+            self.position_bar.setValue(int(max(0.0, min(100.0, position_percent)) * 10))
+            self.position_display.setText(f"{position_percent:.1f}%")
+
+    def _on_joystick_raw_position_changed(self, raw_position: int) -> None:
+        self._joystick_raw_position = raw_position
+
+        calibrated_percent = self._raw_position_to_calibrated_percent(raw_position)
+        if calibrated_percent is not None:
+            smoothed_percent = self._smooth_calibrated_percent(calibrated_percent)
+            self.position_bar.setValue(int(max(0.0, min(100.0, smoothed_percent)) * 10))
+            self.position_display.setText(f"{smoothed_percent:.1f}%")
 
     def _on_joystick_connection_changed(self, connected: bool) -> None:
         self.joystick_led.set_on(connected)
         if connected:
             self.joystick_status.setText(f"{self.joystick_reader.device_path} ativo")
         else:
-            self.joystick_status.setText("Aguardando joystick do Arduino")
+            self.joystick_status.setText(
+                f"Joystick ausente ({self.joystick_reader.device_path}) — "
+                "calibragem falha se transdutor nao variar"
+            )
 
     def _on_joystick_error(self, error_msg: str) -> None:
         self.logger.warning(f"Joystick: {error_msg}")
@@ -959,7 +1144,8 @@ class SccaDashboard(QMainWindow):
     def _on_command_error(self, error_msg: str) -> None:
         """Handler para erros ao enviar comandos."""
         self.logger.error(f"Command Error: {error_msg}")
-        self.maneuver_hint.setText(f"Erro ao enviar: {error_msg}")
+        self.maneuver_hint.setText(f"Erro UDP comando: {error_msg}")
+        self.udp_data_info.setText(f"Falha ao enviar comando UDP: {error_msg}")
 
     def closeEvent(self, event) -> None:
         self.joystick_reader.stop()

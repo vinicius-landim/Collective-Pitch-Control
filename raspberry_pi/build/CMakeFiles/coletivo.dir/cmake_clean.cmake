@@ -1,5 +1,4 @@
 file(REMOVE_RECURSE
-  "CMakeFiles/coletivo.dir/link.d"
   "CMakeFiles/coletivo.dir/src/main.cpp.o"
   "CMakeFiles/coletivo.dir/src/main.cpp.o.d"
   "coletivo"
