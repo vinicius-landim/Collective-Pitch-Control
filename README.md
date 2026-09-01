@@ -1,128 +1,176 @@
-# Interface SCCA (Dashboard + Raspberry agent)
+# Collective Pitch Control Prototype for Helicopter Simulation
 
-Este repositório contém a interface gráfica do Sistema de Comando Coletivo Ativo (SCCA) e o agente de telemetria em C++ para Raspberry Pi.
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="C++" src="https://img.shields.io/badge/C%2B%2B-Raspberry%20Pi-00599C?logo=cplusplus&logoColor=white">
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux-informational?logo=linux&logoColor=white">
+  <img alt="Status" src="https://img.shields.io/badge/Status-Prototype-orange">
+</p>
 
-**Visão geral**
-- Dashboard: UI em Python (PySide6) responsável por exibir telemetria e enviar comandos.
-- Agente Raspberry: programa C++ que lê botões via GPIO e a célula de carga (HX711) e envia telemetria via UDP CSV.
+<p align="center">
+  A functional prototype of an active collective-pitch control system for helicopter simulators, featuring force feedback, motion limits, trim functions, and automated actuation.
+</p>
 
-**Principais mudanças recentes**
-- O código C++ foi reorganizado para `raspberry_pi/` com a estrutura `include/` + `src/` (subpastas `net/`, `gpio/`, `sensor/`).
-- A leitura do HX711 foi migrada para a biblioteca `hx711-1` (wrapper em `src/sensor/hx711_adapter.*`) e usa `isReady()` antes de `read()` (não bloqueante).
+<p align="center">
+  <img src="docs/images/project.png" alt="Collective pitch control prototype" width="1000" />
+</p>
 
-**Build & Execução**
+---
 
-Dashboard (Python)
-- Instalar dependências:
+## Overview
+
+This project reproduces, at an experimental scale, the behavior of a real helicopter collective lever, including force feedback, movement limits, trim functions, and automated actuation. The system combines mechanical design, electronics, embedded control, and real-time communication to provide a realistic and modular platform for simulation applications.
+
+The prototype was developed as part of the course "Projects in Computer Engineering" at the Federal University of São Paulo (ICT-UNIFESP), bringing together undergraduate, master's, and doctoral students to build a product prototype in an interdisciplinary engineering context.
+
+## Hardware Platform
+
+| Component | Specification |
+|---|---|
+| Servo motor | Policomp 86HS118-1560414-B35 |
+| Digital stepper driver | DM860D |
+| Power supply | 48V / 10A switched-mode |
+| Controller | Arduino Leonardo |
+| Embedded computer | Raspberry Pi 5 |
+| Linear transducer | KTC1 — 100 mm |
+| Force sensor module | HX711 + load cell |
+| Limit sensors | 2x QRE1113 analog line sensors |
+| End-stop indicators | 2x SMD LEDs with resistors |
+
+## Software Architecture
+
+The repository is divided into two main software domains:
+
+### 1. Desktop Application
+
+The Python layer implements the user-facing interface and communication with the hardware.
+
+| File | Responsibility |
+|---|---|
+| `main.py` | Application entry point |
+| `scca/dashboard.py` | Dashboard and control logic |
+| `scca/styles.py` | Interface styling and visual theme |
+| `scca/udp_receiver.py` | UDP communication and mock hardware support |
+
+Key responsibilities:
+
+- monitoring the state of the prototype;
+- displaying telemetry;
+- sending control commands;
+- handling user interaction;
+- receiving data from the embedded system.
+
+### 2. Embedded Controller
+
+The C++ project runs on the Raspberry Pi and implements the local control loop, hardware I/O, and actuator behavior.
+
+| File | Responsibility |
+|---|---|
+| `raspberry_pi/CMakeLists.txt` | CMake build configuration |
+| `raspberry_pi/src/main.cpp` | Main embedded control implementation |
+
+Key responsibilities:
+
+- reading the load cell;
+- checking end-stop sensors;
+- controlling the stepper motor;
+- managing trim and autopilot logic;
+- applying calibration and motion limits;
+- transmitting UDP telemetry and receiving control packets.
+
+## Repository Structure
+
+```text
+.
+├── README.md
+├── main.py
+├── requirements.txt
+├── docs/
+│   └── images/
+├── raspberry_pi/
+│   ├── CMakeLists.txt
+│   ├── build/
+│   ├── scripts/
+│   └── src/
+│       └── main.cpp
+├── scca/
+│   ├── __init__.py
+│   ├── dashboard.py
+│   ├── styles.py
+│   └── udp_receiver.py
+├── scripts/
+│   ├── check-network.sh
+│   ├── fix-pc-ethernet.sh
+│   └── configure-static-ip.sh
+└── .venv/
+```
+
+| Directory / File | Description |
+|---|---|
+| `main.py` | Runs the dashboard application |
+| `scca/` | Python package for the simulator interface and communication layer |
+| `raspberry_pi/` | Embedded software for the Raspberry Pi controller |
+| `scripts/` | Network and maintenance utilities |
+| `docs/` | Documentation resources and images |
+| `raspberry_pi/build/` | Generated CMake build artifacts for the Pi project |
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10+
+- Qt 6 / PySide6
+- CMake and a C++ compiler for the Raspberry Pi controller
+- Access to the Raspberry Pi hardware platform
+- Linux environment for development and execution
+
+### Python Environment
+
+Create a virtual environment and install dependencies:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
-- Executar:
+
+Run the dashboard:
 
 ```bash
 python main.py
 ```
 
-Agente Raspberry (C++)
-- Entre em `raspberry_pi/` e rode:
+### Embedded Controller Build
+
+Build the Raspberry Pi project:
 
 ```bash
 cd raspberry_pi
-make
+cmake -S . -B build
+cmake --build build
 ```
 
-- Isso compila o agente e gera o executável `udp_csv` no diretório `raspberry_pi`.
-- Para instalar no sistema (sudo):
+The resulting executable is generated in the `build` directory and is intended to run on the Raspberry Pi hardware.
 
-```bash
-make install
-```
+## Communication and Control
 
-Executar o agente:
+The system relies on UDP communication between the desktop application and the embedded controller.
 
-```bash
-./udp_csv <IP_dashboard> <porta_dashboard> [porta_local_escuta]
-```
+- **Dashboard → Raspberry Pi:** command packets and configuration data
+- **Raspberry Pi → Dashboard:** telemetry, state, and operational status
 
-Exemplo:
+This allows the control logic to be evaluated in real time and makes the system portable to different interfaces and testing setups.
 
-```bash
-./udp_csv 192.168.1.100 12345 12346
-```
+## Operational Modes
 
-**Estrutura do repositório (relevante)**
-- `main.py` — entrada da aplicação Python (Dashboard).
-- `raspberry_pi/` — código do agente C++ e Makefile.
-	- `raspberry_pi/include/telemetry.hpp` — tipos e helpers CSV (namespace `scca`).
-	- `raspberry_pi/src/main.cpp` — entrypoint do agente.
-	- `raspberry_pi/src/net/udp_comm.*` — socket UDP não-bloqueante.
-	- `raspberry_pi/src/gpio/gpio_input_reader.*` — leitura de botões (libgpiod).
-	- `raspberry_pi/src/sensor/hx711_adapter.*` — wrapper para `hx711-1`.
-	- `raspberry_pi/Makefile` — build e targets úteis (all/clean/install/run).
+The active collective control prototype includes several logical states and behaviors, such as:
 
-**Variáveis de ambiente (configuração de hardware)**
-- `SCCA_USE_GPIO` — `1` para habilitar GPIO real (caso contrário, modo simulado).
-- GPIO pins: `SCCA_GPIO_BEEP_UP`, `SCCA_GPIO_BEEP_DOWN`, `SCCA_GPIO_TRIM_RELEASE`, `SCCA_GPIO_OVERRIDE`.
-- HX711: `SCCA_GPIO_HX711_DOUT`, `SCCA_GPIO_HX711_SCK`, `SCCA_GPIO_HX711_GAIN_PULSES`.
+- idle state
+- manual movement
+- trim release
+- beep trim up/down
+- motion limits and safeties
+- autopilot execution
+- simulated hydraulic failure conditions
 
-Exemplo:
-
-```bash
-export SCCA_USE_GPIO=1
-export SCCA_GPIO_BEEP_UP=17
-export SCCA_GPIO_BEEP_DOWN=27
-export SCCA_GPIO_HX711_DOUT=5
-export SCCA_GPIO_HX711_SCK=6
-./udp_csv 192.168.1.100 12345
-```
-
-**Dependências de sistema (Raspberry Pi)**
-- `libgpiod-dev` — para acesso a GPIO via libgpiod.
-- `libhx711` — a biblioteca `hx711-1` (há um subdiretório `hx711/` no repositório; execute `cd hx711 && make && sudo make install` para instalar quando necessário).
-
-Instalação de exemplo:
-
-```bash
-sudo apt update
-sudo apt install build-essential libgpiod-dev git unzip wget
-# Opcional: instalar lgpio e hx711 via scripts abaixo
-```
-
-Instalação automática (lgpio + hx711)
-
-Dentro de `raspberry_pi/` existe um script que compila e instala `lgpio` e `hx711` localmente:
-
-```bash
-cd raspberry_pi
-bash scripts/install_libs.sh
-```
-
-O script executa (equivalente a):
-
-lgpio:
-
-```bash
-wget http://abyz.me.uk/lg/lg.zip
-unzip lg.zip
-cd lg
-make
-sudo make install
-```
-
-hx711:
-
-```bash
-git clone https://github.com/endail/hx711
-cd hx711
-make && sudo make install
-```
-
-**Logs / Debug**
-- O agente C++ imprime `TX C: ...` quando envia telemetria e `RX P: ...` quando recebe comandos. Use esse log para depuração.
-
-**Testes e simulação**
-- Você pode rodar o dashboard em modo simulado (sem Raspberry) e usar scripts de test para enviar pacotes UDP. Se desejar, eu adiciono scripts de simulação atualizados ou um README específico em `raspberry_pi/` com exemplos step-by-step.
-
----
-Se quiser, atualizo também um README interno em `raspberry_pi/` com exemplos de deploy (scp/ssh) e um target `deploy` no `Makefile`.
+These modes are implemented both in the embedded controller and reflected in the graphical dashboard for monitoring and debugging.
